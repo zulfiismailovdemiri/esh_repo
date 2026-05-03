@@ -1,0 +1,6 @@
+{
+  "name": "template",
+  "version": "main",
+  "description": "Template processing for ESH",
+  "files": ["template.go"]
+}

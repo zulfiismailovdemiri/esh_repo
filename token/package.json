@@ -1,0 +1,6 @@
+{
+  "name": "token",
+  "version": "main",
+  "description": "Token definitions for ESH",
+  "files": ["token.go"]
+}

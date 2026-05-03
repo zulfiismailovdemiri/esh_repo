@@ -1,0 +1,6 @@
+{
+  "name": "ast",
+  "version": "main",
+  "description": "AST definitions for ESH",
+  "files": ["ast.go"]
+}

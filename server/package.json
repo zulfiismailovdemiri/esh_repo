@@ -1,0 +1,6 @@
+{
+  "name": "server",
+  "version": "main",
+  "description": "Server implementation for ESH",
+  "files": ["server.go"]
+}

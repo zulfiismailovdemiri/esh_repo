@@ -1,0 +1,6 @@
+{
+  "name": "parser",
+  "version": "main",
+  "description": "Parser for ESH",
+  "files": ["parser.go"]
+}

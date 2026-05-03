@@ -1,0 +1,6 @@
+{
+  "name": "builtins",
+  "version": "main",
+  "description": "Built-in functions for ESH",
+  "files": ["builtins.go"]
+}

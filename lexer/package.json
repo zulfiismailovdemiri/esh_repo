@@ -1,0 +1,6 @@
+{
+  "name": "lexer",
+  "version": "main",
+  "description": "Lexer for ESH",
+  "files": ["lexer.go"]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "db",
+  "version": "main",
+  "description": "Database extension for ESH",
+  "files": ["db.go"]
+}

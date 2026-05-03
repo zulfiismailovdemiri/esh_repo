@@ -1,0 +1,6 @@
+{
+  "name": "object",
+  "version": "main",
+  "description": "Object system for ESH",
+  "files": ["object.go"]
+}

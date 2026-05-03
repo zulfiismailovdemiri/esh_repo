@@ -1,0 +1,6 @@
+{
+  "name": "evaluator",
+  "version": "main",
+  "description": "Evaluator for ESH",
+  "files": ["evaluator.go"]
+}

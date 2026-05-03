@@ -1,0 +1,6 @@
+{
+  "name": "environment",
+  "version": "main",
+  "description": "Environment management for ESH",
+  "files": ["environment.go"]
+}
