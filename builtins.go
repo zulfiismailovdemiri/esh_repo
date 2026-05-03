@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+// RegisterBuiltin lets extension packages (from esh_vendors/) add new
+// built-in functions without editing this file directly.
+func RegisterBuiltin(name string, fn func(*Environment, ...Object) Object) {
+	builtins[name] = &Builtin{Name: name, Fn: fn}
+}
+
 var builtins = map[string]*Builtin{
 	"print": {Name: "print", Fn: func(env *Environment, args ...Object) Object {
 		parts := []string{}
