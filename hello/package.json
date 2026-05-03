@@ -1,0 +1,5 @@
+{
+  "name": "hello",                       
+  "version": "main",                                                              "description": "Example ESH extension",
+  "files": ["hello.go"]                  
+}
