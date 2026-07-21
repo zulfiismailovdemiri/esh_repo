@@ -2,11 +2,19 @@ package esh_vendors
 
 import (
 	"bytes"
+	"cmp"
+	"crypto/rand"
 	"fmt"
+	"io"
 	"math"
+	"math/big"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,6 +23,10 @@ import (
 // built-in functions without editing this file directly.
 func RegisterBuiltin(name string, fn func(*Environment, ...Object) Object) {
 	builtins[name] = &Builtin{Name: name, Fn: fn}
+}
+
+func GetBuiltin(name string) *Builtin {
+	return builtins[name]
 }
 
 var builtins = map[string]*Builtin{
@@ -217,11 +229,16 @@ var builtins = map[string]*Builtin{
 		if !ok {
 			return &Error{Message: "explode separator must be string"}
 		}
-		s, ok := args[1].(*String)
-		if !ok {
+		var sVal string
+		switch v := args[1].(type) {
+		case *String:
+			sVal = v.Value
+		case *Null:
+			sVal = ""
+		default:
 			return &Error{Message: "explode second arg must be string"}
 		}
-		parts := strings.Split(s.Value, sep.Value)
+		parts := strings.Split(sVal, sep.Value)
 		out := NewArray()
 		for i, p := range parts {
 			out.Set(ArrayKey{IntVal: int64(i)}, &String{Value: p})
@@ -337,7 +354,7 @@ var builtins = map[string]*Builtin{
 			port = "1025" // Mailpit default
 		}
 
-		subject := "Contact Form"
+		subject := "Message"
 		if s, exists := data.Items[ArrayKey{IsString: true, StrVal: "subject"}]; exists {
 			subject = toString(s)
 		}
@@ -347,7 +364,15 @@ var builtins = map[string]*Builtin{
 			body = toString(b)
 		}
 
-		msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s", from, to.Value, subject, body)
+		contentType := "text/plain; charset=UTF-8"
+		if t, exists := data.Items[ArrayKey{IsString: true, StrVal: "type"}]; exists {
+			if toString(t) == "html" {
+				contentType = "text/html; charset=UTF-8"
+			}
+		}
+
+		msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: %s\r\n\r\n%s",
+			from, to.Value, subject, contentType, body)
 
 		var auth smtp.Auth
 		if user != "" || pass != "" {
@@ -402,6 +427,239 @@ var builtins = map[string]*Builtin{
 	}},
 	"time": {Name: "time", Fn: func(env *Environment, args ...Object) Object {
 		return &Integer{Value: time.Now().Unix()}
+	}},
+	"urlencode": {Name: "urlencode", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) != 1 {
+			return &Error{Message: "urlencode expects 1 argument"}
+		}
+		s, ok := args[0].(*String)
+		if !ok {
+			return &Error{Message: "urlencode expects string"}
+		}
+		return &String{Value: url.QueryEscape(s.Value)}
+	}},
+	"urldecode": {Name: "urldecode", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) != 1 {
+			return &Error{Message: "urldecode expects 1 argument"}
+		}
+		s, ok := args[0].(*String)
+		if !ok {
+			return &Error{Message: "urldecode expects string"}
+		}
+		val, err := url.QueryUnescape(s.Value)
+		if err != nil {
+			return &Error{Message: "urldecode error: " + err.Error()}
+		}
+		return &String{Value: val}
+	}},
+	"sort": {Name: "sort", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) != 1 {
+			return &Error{Message: "sort expects 1 argument"}
+		}
+		arr, ok := args[0].(*Array)
+		if !ok {
+			return &Error{Message: "sort expects array"}
+		}
+		slices.SortFunc(arr.Order, func(a, b ArrayKey) int {
+			va := arr.Items[a]
+			vb := arr.Items[b]
+			return cmp.Compare(va.Inspect(), vb.Inspect())
+		})
+		return NULL_VALUE
+	}},
+	"array_merge": {Name: "array_merge", Fn: func(env *Environment, args ...Object) Object {
+		out := NewArray()
+		for _, arg := range args {
+			arr, ok := arg.(*Array)
+			if !ok {
+				return &Error{Message: "array_merge expects arrays"}
+			}
+			for _, k := range arr.Order {
+				nextIdx := nextArrayIntKey(out)
+				out.Set(ArrayKey{IntVal: nextIdx}, arr.Items[k])
+			}
+		}
+		return out
+	}},
+	"array_fill": {Name: "array_fill", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) != 3 {
+			return &Error{Message: "array_fill expects (start_index, num, value)"}
+		}
+		start, ok1 := args[0].(*Integer)
+		num, ok2 := args[1].(*Integer)
+		if !ok1 || !ok2 {
+			return &Error{Message: "array_fill expects integer for first two args"}
+		}
+		val := args[2]
+		out := NewArray()
+		for i := int64(0); i < num.Value; i++ {
+			out.Set(ArrayKey{IntVal: start.Value + i}, val)
+		}
+		return out
+	}},
+	"floatval": {Name: "floatval", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) != 1 {
+			return &Error{Message: "floatval expects 1 argument"}
+		}
+		return &Float{Value: toFloat(args[0])}
+	}},
+	"intval": {Name: "intval", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) != 1 {
+			return &Error{Message: "intval expects 1 argument"}
+		}
+		switch v := args[0].(type) {
+		case *Integer:
+			return v
+		case *Float:
+			return &Integer{Value: int64(v.Value)}
+		case *String:
+			i, _ := strconv.ParseInt(v.Value, 10, 64)
+			return &Integer{Value: i}
+		default:
+			return &Integer{Value: 0}
+		}
+	}},
+	"rand_int": {Name: "rand_int", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) != 2 {
+			return &Error{Message: "rand_int expects 2 arguments (min, max)"}
+		}
+		min, ok1 := args[0].(*Integer)
+		max, ok2 := args[1].(*Integer)
+		if !ok1 || !ok2 {
+			return &Error{Message: "rand_int arguments must be integers"}
+		}
+		if min.Value > max.Value {
+			return &Error{Message: "rand_int: min cannot be greater than max"}
+		}
+		diff := max.Value - min.Value + 1
+		n, err := rand.Int(rand.Reader, big.NewInt(diff))
+		if err != nil {
+			return &Error{Message: "rand_int error: " + err.Error()}
+		}
+		return &Integer{Value: n.Int64() + min.Value}
+	}},
+	"rand": {Name: "rand", Fn: func(env *Environment, args ...Object) Object {
+		n, err := rand.Int(rand.Reader, big.NewInt(math.MaxInt64))
+		if err != nil {
+			return &Error{Message: "rand error: " + err.Error()}
+		}
+		return &Integer{Value: n.Int64()}
+	}},
+	"is_error": {Name: "is_error", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) != 1 {
+			return &Error{Message: "is_error expects 1 argument"}
+		}
+		_, ok := args[0].(*Error)
+		return boolToObj(ok)
+	}},
+	"sprintf": {Name: "sprintf", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) < 1 {
+			return &Error{Message: "sprintf expects at least 1 argument"}
+		}
+		format, ok := args[0].(*String)
+		if !ok {
+			return &Error{Message: "sprintf expects first argument to be string"}
+		}
+		if len(args) == 1 {
+			return format
+		}
+		var goArgs []any
+		for _, arg := range args[1:] {
+			switch v := arg.(type) {
+			case *Integer:
+				goArgs = append(goArgs, v.Value)
+			case *Float:
+				goArgs = append(goArgs, v.Value)
+			case *String:
+				goArgs = append(goArgs, v.Value)
+			case *Boolean:
+				goArgs = append(goArgs, v.Value)
+			case *Null:
+				goArgs = append(goArgs, nil)
+			default:
+				goArgs = append(goArgs, v.Inspect())
+			}
+		}
+		return &String{Value: fmt.Sprintf(format.Value, goArgs...)}
+	}},
+	"number_format": {Name: "number_format", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) < 1 {
+			return &Error{Message: "number_format expects at least 1 argument"}
+		}
+		val := toFloat(args[0])
+		decimals := int64(0)
+		if len(args) >= 2 {
+			if d, ok := args[1].(*Integer); ok {
+				decimals = d.Value
+			}
+		}
+		decPoint := "."
+		if len(args) >= 3 {
+			if s, ok := args[2].(*String); ok {
+				decPoint = s.Value
+			}
+		}
+		thousandsSep := ","
+		if len(args) >= 4 {
+			if s, ok := args[3].(*String); ok {
+				thousandsSep = s.Value
+			}
+		}
+		format := "%." + fmt.Sprintf("%d", decimals) + "f"
+		s := fmt.Sprintf(format, val)
+		if decPoint != "." || thousandsSep != "" {
+			parts := strings.Split(s, ".")
+			intPart := parts[0]
+			decPart := ""
+			if len(parts) > 1 {
+				decPart = parts[1]
+			}
+			var res strings.Builder
+			for i, r := range intPart {
+				if i > 0 && (len(intPart)-i)%3 == 0 {
+					res.WriteString(thousandsSep)
+				}
+				res.WriteRune(r)
+			}
+			if decPart != "" || decimals > 0 {
+				res.WriteString(decPoint)
+				res.WriteString(decPart)
+			}
+			s = res.String()
+		}
+		return &String{Value: s}
+	}},
+	"file_save": {Name: "file_save", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) != 2 {
+			return &Error{Message: "file_save expects 2 arguments: tmp_path, dest_path"}
+		}
+		tmpPath, ok1 := args[0].(*String)
+		destRel, ok2 := args[1].(*String)
+		if !ok1 || !ok2 {
+			return &Error{Message: "file_save expects string arguments"}
+		}
+		dest := destRel.Value
+		if !filepath.IsAbs(dest) {
+			dest = filepath.Join(env.BaseDir, dest)
+		}
+		if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+			return &Error{Message: "file_save: mkdir: " + err.Error()}
+		}
+		src, err := os.Open(tmpPath.Value)
+		if err != nil {
+			return &Error{Message: "file_save: open: " + err.Error()}
+		}
+		defer src.Close()
+		dst, err := os.Create(dest)
+		if err != nil {
+			return &Error{Message: "file_save: create: " + err.Error()}
+		}
+		defer dst.Close()
+		if _, err := io.Copy(dst, src); err != nil {
+			return &Error{Message: "file_save: copy: " + err.Error()}
+		}
+		os.Remove(tmpPath.Value)
+		return &String{Value: destRel.Value}
 	}},
 }
 
@@ -462,7 +720,15 @@ func init() {
 				if !k.IsString {
 					continue // skip numeric keys
 				}
-				inner.Set(k.StrVal, vars.Items[k])
+				// Variable names in the env are stored with their leading '$',
+				// matching the lexer/parser. The caller writes
+				// render("partial.es", ["username" => $u]) and the partial
+				// reads $username, so we must register the local under "$key".
+				name := k.StrVal
+				if !strings.HasPrefix(name, "$") {
+					name = "$" + name
+				}
+				inner.Set(name, vars.Items[k])
 			}
 		}
 

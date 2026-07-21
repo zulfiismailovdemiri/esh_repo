@@ -2,5 +2,5 @@
   "name": "lexer",
   "version": "main",
   "description": "Lexer for ESH",
-  "files": ["lexer.go"]
+  "files": ["lexer.go", "lexer_test.go"]
 }

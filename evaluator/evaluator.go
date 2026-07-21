@@ -2,9 +2,9 @@ package esh_vendors
 
 import (
 	"fmt"
-	"os"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 func Eval(node Node, env *Environment) Object {
@@ -14,11 +14,19 @@ func Eval(node Node, env *Environment) Object {
 	case *BlockStatement:
 		return evalBlock(n, env)
 	case *AssignStatement:
+		// Allow $err = mail(...) to capture errors as values rather than
+		// aborting the script. Callers can use is_error() to inspect them.
 		val := Eval(n.Value, env)
-		if IsError(val) {
-			return val
+		switch target := n.Name.(type) {
+		case *Variable:
+			env.Set(target.Name, val)
+		case *IndexExpression:
+			if err := evalIndexAssignment(target, val, env); IsError(err) {
+				return err
+			}
+		default:
+			return &Error{Message: "invalid assignment target"}
 		}
-		env.Set(n.Name.Name, val)
 		return NULL_VALUE
 	case *EchoStatement:
 		val := Eval(n.Value, env)
@@ -54,7 +62,7 @@ func Eval(node Node, env *Environment) Object {
 		if v, ok := env.Get(n.Name); ok {
 			return v
 		}
-		return &Error{Message: fmt.Sprintf("undefined variable $%s", n.Name)}
+		return &Error{Message: fmt.Sprintf("undefined variable %s", n.Name)} // Name already includes '$'
 	case *Identifier:
 		if v, ok := env.Get(n.Name); ok {
 			return v
@@ -139,8 +147,9 @@ func evalProgram(p *Program, env *Environment) Object {
 			return rv.Value
 		}
 		if IsError(result) {
-			if os.Getenv("ESH_LOG_INFO_ENABLED") == "true" {
-				fmt.Fprintf(env.Out, "\n<!-- [ERROR] %s -->\n", result.Inspect())
+			// exit() returns this sentinel; treat it as a clean termination.
+			if errObj, _ := result.(*Error); errObj != nil && errObj.Message == "EXIT_SENTINEL" {
+				return NULL_VALUE
 			}
 			return result
 		}
@@ -273,25 +282,7 @@ func evalPrefix(op string, right Object) Object {
 }
 
 func evalInfix(op string, left, right Object) Object {
-	// String concatenation
-	if op == "." {
-		return &String{Value: toString(left) + toString(right)}
-	}
-
-	// Numeric ops: promote int+float -> float
-	if isNumeric(left) && isNumeric(right) {
-		if left.Type() == OBJ_FLOAT || right.Type() == OBJ_FLOAT {
-			return evalFloatInfix(op, toFloat(left), toFloat(right))
-		}
-		return evalIntInfix(op, left.(*Integer).Value, right.(*Integer).Value)
-	}
-
-	// String comparison/equality
-	if left.Type() == OBJ_STRING && right.Type() == OBJ_STRING {
-		return evalStringInfix(op, left.(*String).Value, right.(*String).Value)
-	}
-
-	// Logical (works on any truthy values)
+	// Logical and equality ops work on any value type — check before type-specific branches
 	switch op {
 	case "&&":
 		return boolToObj(isTruthy(left) && isTruthy(right))
@@ -302,6 +293,25 @@ func evalInfix(op string, left, right Object) Object {
 	case "!=":
 		return boolToObj(!objectsEqual(left, right))
 	}
+
+	// String concatenation
+	if op == "." {
+		return &String{Value: toString(left) + toString(right)}
+	}
+
+	// Numeric ops: promote int+float -> float
+	if isNumeric(left) && isNumeric(right) {
+		if hasFloatPart(left) || hasFloatPart(right) {
+			return evalFloatInfix(op, toFloat(left), toFloat(right))
+		}
+		return evalIntInfix(op, toInt(left), toInt(right))
+	}
+
+	// String comparison
+	if left.Type() == OBJ_STRING && right.Type() == OBJ_STRING {
+		return evalStringInfix(op, left.(*String).Value, right.(*String).Value)
+	}
+
 	return &Error{Message: fmt.Sprintf("type mismatch: %s %s %s", left.Type(), op, right.Type())}
 }
 
@@ -454,6 +464,54 @@ func evalIndex(left, idx Object) Object {
 	return NULL_VALUE
 }
 
+// evalIndexAssignment handles `$x[i] = v`, `$x[] = v` (append), and chained
+// forms like `$x[a][b] = v`. The right-hand value has already been evaluated.
+func evalIndexAssignment(n *IndexExpression, val Object, env *Environment) Object {
+	left := Eval(n.Left, env)
+	if IsError(left) {
+		return left
+	}
+	arr, ok := left.(*Array)
+	if !ok {
+		// `$x[...]= ...` against an unset/non-array variable initialises
+		// it as a fresh array on first use, mirroring PHP semantics.
+		if v, isVar := n.Left.(*Variable); isVar {
+			arr = NewArray()
+			env.Set(v.Name, arr)
+		} else {
+			return &Error{Message: "index assignment target is not an array"}
+		}
+	}
+
+	var key ArrayKey
+	if n.Index == nil {
+		// Append form $x[] = v — pick max int key + 1.
+		maxIdx := int64(-1)
+		for _, k := range arr.Order {
+			if !k.IsString && k.IntVal > maxIdx {
+				maxIdx = k.IntVal
+			}
+		}
+		key = ArrayKey{IntVal: maxIdx + 1}
+	} else {
+		idx := Eval(n.Index, env)
+		if IsError(idx) {
+			return idx
+		}
+		switch i := idx.(type) {
+		case *Integer:
+			key = ArrayKey{IntVal: i.Value}
+		case *String:
+			key = ArrayKey{IsString: true, StrVal: i.Value}
+		default:
+			return &Error{Message: "array index must be integer or string"}
+		}
+	}
+
+	arr.Set(key, val)
+	return NULL_VALUE
+}
+
 func applyFunction(env *Environment, fn Object, args []Object) Object {
 	switch f := fn.(type) {
 	case *Function:
@@ -484,13 +542,21 @@ func applyFunction(env *Environment, fn Object, args []Object) Object {
 var interpVarRe = regexp.MustCompile(`\$([a-zA-Z_][a-zA-Z0-9_]*)`)
 
 func interpolate(s string, env *Environment) string {
-	return interpVarRe.ReplaceAllStringFunc(s, func(match string) string {
-		name := match[1:]
-		if v, ok := env.Get(name); ok {
+	result := interpVarRe.ReplaceAllStringFunc(s, func(match string) string {
+		// Variables are stored under their '$'-prefixed name (see lexer.go),
+		// so the lookup key must keep the '$' rather than strip it.
+		if v, ok := env.Get(match); ok {
 			return toString(v)
 		}
 		return ""
 	})
+	// A user-escaped "\$" was lexed into escapedDollarMarker (see lexer.go)
+	// specifically so it survives the substitution pass above untouched;
+	// only now do we turn it into the literal '$' the escape asked for.
+	if strings.IndexByte(result, escapedDollarMarker) != -1 {
+		result = strings.ReplaceAll(result, string(escapedDollarMarker), "$")
+	}
+	return result
 }
 
 func toString(o Object) string {
@@ -518,12 +584,48 @@ func toFloat(o Object) float64 {
 		return float64(v.Value)
 	case *Float:
 		return v.Value
+	case *String:
+		f, _ := strconv.ParseFloat(v.Value, 64)
+		return f
 	}
 	return 0
 }
 
+func toInt(o Object) int64 {
+	switch v := o.(type) {
+	case *Integer:
+		return v.Value
+	case *Float:
+		return int64(v.Value)
+	case *String:
+		if i, err := strconv.ParseInt(v.Value, 10, 64); err == nil {
+			return i
+		}
+		f, _ := strconv.ParseFloat(v.Value, 64)
+		return int64(f)
+	}
+	return 0
+}
+
+func hasFloatPart(o Object) bool {
+	if o.Type() == OBJ_FLOAT {
+		return true
+	}
+	if s, ok := o.(*String); ok {
+		return strings.ContainsAny(s.Value, ".eE")
+	}
+	return false
+}
+
 func isNumeric(o Object) bool {
-	return o.Type() == OBJ_INT || o.Type() == OBJ_FLOAT
+	if o.Type() == OBJ_INT || o.Type() == OBJ_FLOAT {
+		return true
+	}
+	if s, ok := o.(*String); ok {
+		_, err := strconv.ParseFloat(s.Value, 64)
+		return err == nil
+	}
+	return false
 }
 
 func isTruthy(o Object) bool {

@@ -159,13 +159,11 @@ func (p *Parser) parseStatement() Statement {
 		// empty statement (e.g. stray ';' from template preprocessor)
 		return nil
 	case VAR:
-		if p.peekTokenIs(ASSIGN) {
-			return p.parseAssignStatement()
-		}
-		if _, ok := compoundAssignOp[p.peekToken.Type]; ok {
-			return p.parseCompoundAssignStatement()
-		}
-		return p.parseExpressionStatement()
+		// parseAssignStatement handles plain assignment, compound assignment,
+		// indexed assignment ($x[i] = ...) and append ($x[] = ...). It falls
+		// back to ExpressionStatement when the variable is not followed by an
+		// assignment operator.
+		return p.parseAssignStatement()
 	case ECHO:
 		return p.parseEchoStatement()
 	case RETURN:
@@ -185,17 +183,49 @@ func (p *Parser) parseStatement() Statement {
 	}
 }
 
-func (p *Parser) parseAssignStatement() *AssignStatement {
-	stmt := &AssignStatement{Name: &Variable{Name: p.curToken.Literal}}
-	if !p.expectPeek(ASSIGN) {
-		return nil
-	}
-	p.nextToken()
-	stmt.Value = p.parseExpression(LOWEST)
-	if p.peekTokenIs(SEMICOLON) {
+func (p *Parser) parseAssignStatement() Statement {
+	// Current token is VAR (e.g. $x)
+	left := p.parseVariable()
+
+	// Consume any chained index expressions: $x[a][b]
+	for p.peekTokenIs(LBRACKET) {
 		p.nextToken()
+		left = p.parseIndexExpression(left)
 	}
-	return stmt
+
+	// Compound assignment: $x op= rhs
+	if _, ok := compoundAssignOp[p.peekToken.Type]; ok {
+		p.nextToken()
+		op := compoundAssignOp[p.curToken.Type]
+		p.nextToken()
+		rhs := p.parseExpression(LOWEST)
+		if p.peekTokenIs(SEMICOLON) {
+			p.nextToken()
+		}
+		return &AssignStatement{
+			Name: left,
+			Value: &InfixExpression{
+				Left:     left,
+				Operator: op,
+				Right:    rhs,
+			},
+		}
+	}
+
+	// Plain assignment: $x = rhs
+	if p.peekTokenIs(ASSIGN) {
+		p.nextToken()
+		p.nextToken()
+		stmt := &AssignStatement{Name: left}
+		stmt.Value = p.parseExpression(LOWEST)
+		if p.peekTokenIs(SEMICOLON) {
+			p.nextToken()
+		}
+		return stmt
+	}
+
+	// Otherwise the variable was used as an expression — treat as ExpressionStatement.
+	return &ExpressionStatement{Expression: left}
 }
 
 //	parseCompoundAssignStatement turns `$x += rhs;` into AssignStatement{
@@ -256,10 +286,13 @@ func (p *Parser) parseIfStatement() *IfStatement {
 	if !p.expectPeek(RPAREN) {
 		return nil
 	}
-	if !p.expectPeek(LBRACE) {
-		return nil
+	if p.peekTokenIs(LBRACE) {
+		p.nextToken()
+		stmt.Consequence = p.parseBlockStatement()
+	} else {
+		p.nextToken()
+		stmt.Consequence = p.parseStatement()
 	}
-	stmt.Consequence = p.parseBlockStatement()
 	if p.peekTokenIs(ELSE) {
 		p.nextToken()
 		if p.peekTokenIs(IF) {
@@ -269,8 +302,8 @@ func (p *Parser) parseIfStatement() *IfStatement {
 			p.nextToken()
 			stmt.Alternative = p.parseBlockStatement()
 		} else {
-			p.addError("expected '{' or 'if' after 'else'")
-			return nil
+			p.nextToken()
+			stmt.Alternative = p.parseStatement()
 		}
 	}
 	return stmt
@@ -286,10 +319,13 @@ func (p *Parser) parseWhileStatement() *WhileStatement {
 	if !p.expectPeek(RPAREN) {
 		return nil
 	}
-	if !p.expectPeek(LBRACE) {
-		return nil
+	if p.peekTokenIs(LBRACE) {
+		p.nextToken()
+		stmt.Body = p.parseBlockStatement()
+	} else {
+		p.nextToken()
+		stmt.Body = p.parseStatement()
 	}
-	stmt.Body = p.parseBlockStatement()
 	return stmt
 }
 
@@ -311,10 +347,13 @@ func (p *Parser) parseForStatement() *ForStatement {
 	if !p.expectPeek(RPAREN) {
 		return nil
 	}
-	if !p.expectPeek(LBRACE) {
-		return nil
+	if p.peekTokenIs(LBRACE) {
+		p.nextToken()
+		stmt.Body = p.parseBlockStatement()
+	} else {
+		p.nextToken()
+		stmt.Body = p.parseStatement()
 	}
-	stmt.Body = p.parseBlockStatement()
 	return stmt
 }
 
@@ -350,10 +389,13 @@ func (p *Parser) parseForeachStatement() *ForeachStatement {
 	if !p.expectPeek(RPAREN) {
 		return nil
 	}
-	if !p.expectPeek(LBRACE) {
-		return nil
+	if p.peekTokenIs(LBRACE) {
+		p.nextToken()
+		stmt.Body = p.parseBlockStatement()
+	} else {
+		p.nextToken()
+		stmt.Body = p.parseStatement()
 	}
-	stmt.Body = p.parseBlockStatement()
 	return stmt
 }
 
@@ -619,7 +661,12 @@ func (p *Parser) parseCallExpression(fn Expression) Expression {
 
 func (p *Parser) parseIndexExpression(left Expression) Expression {
 	expr := &IndexExpression{Left: left}
-	p.nextToken()
+	p.nextToken() // consume '['
+	if p.curTokenIs(RBRACKET) {
+		// $x[] — append form, only valid as an assignment target.
+		expr.Index = nil
+		return expr
+	}
 	expr.Index = p.parseExpression(LOWEST)
 	if !p.expectPeek(RBRACKET) {
 		return nil

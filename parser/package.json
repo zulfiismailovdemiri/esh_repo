@@ -2,5 +2,5 @@
   "name": "parser",
   "version": "main",
   "description": "Parser for ESH",
-  "files": ["parser.go"]
+  "files": ["parser.go", "parser_test.go"]
 }

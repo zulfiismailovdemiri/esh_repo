@@ -2,5 +2,5 @@
   "name": "evaluator",
   "version": "main",
   "description": "Evaluator for ESH",
-  "files": ["evaluator.go"]
+  "files": ["evaluator.go", "evaluator_test.go"]
 }

@@ -3,6 +3,7 @@ package esh_vendors
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -268,7 +269,52 @@ func init() {
 			return &Error{Message: "db_exec: " + err.Error()}
 		}
 		n, _ := res.RowsAffected()
-		return &Integer{Value: n}
+		// last_insert_id is 0 on PostgreSQL (lib/pq doesn't support it);
+		// templates should use INSERT ... RETURNING id with db_query_one.
+		lastId, _ := res.LastInsertId()
+
+		result := NewArray()
+		result.Set(ArrayKey{IsString: true, StrVal: "rows_affected"}, &Integer{Value: n})
+		result.Set(ArrayKey{IsString: true, StrVal: "last_insert_id"}, &Integer{Value: lastId})
+		return result
+	}}
+
+	// db_execute is an alias for db_exec
+	builtins["db_execute"] = builtins["db_exec"]
+
+	builtins["db_query_one"] = &Builtin{Name: "db_query_one", Fn: func(env *Environment, args ...Object) Object {
+		res := builtins["db_query"].Fn(env, args...)
+		if err, ok := res.(*Error); ok {
+			return err
+		}
+		arr, ok := res.(*Array)
+		if !ok || len(arr.Order) == 0 {
+			return NULL_VALUE
+		}
+		return arr.Items[arr.Order[0]]
+	}}
+
+	builtins["db_last_insert_id"] = &Builtin{Name: "db_last_insert_id", Fn: func(env *Environment, args ...Object) Object {
+		// PostgreSQL doesn't support sql.Result.LastInsertId(); templates
+		// should normally use INSERT ... RETURNING id via db_query_one.
+		// As a fallback we accept a sequence name and read its last value.
+		if DB == nil {
+			return &Error{Message: "db_last_insert_id: no database connection"}
+		}
+		var seqName string
+		if len(args) > 0 {
+			if s, ok := args[0].(*String); ok {
+				seqName = s.Value
+			}
+		}
+		if seqName == "" {
+			return &Error{Message: "db_last_insert_id: sequence name required for PostgreSQL"}
+		}
+		var id int64
+		if err := DB.QueryRow("SELECT last_value FROM " + seqName).Scan(&id); err != nil {
+			return &Error{Message: "db_last_insert_id: " + err.Error()}
+		}
+		return &Integer{Value: id}
 	}}
 
 	builtins["session_start"] = &Builtin{Name: "session_start", Fn: func(env *Environment, args ...Object) Object {
@@ -284,19 +330,32 @@ func init() {
 		}
 		if id == "" || !sessionExists(id) {
 			id = generateSessionID()
-			if env.Writer != nil {
-				http.SetCookie(env.Writer, &http.Cookie{
-					Name:     "ESH_SESSION",
-					Value:    id,
-					Path:     "/",
-					HttpOnly: true,
-					SameSite: http.SameSiteLaxMode,
-				})
-			}
 			saveSessionData(id, map[string]string{})
 		}
 		env.SessionID = id
 		env.SessionData = loadSessionData(id)
+
+		// Inject _SESSION superglobal so templates can read session data
+		// directly (e.g. $_SESSION["user_id"]) in addition to session_get().
+		sessionArr := NewArray()
+		for k, v := range env.SessionData {
+			sessionArr.Set(ArrayKey{IsString: true, StrVal: k}, &String{Value: v})
+		}
+		env.Set("$_SESSION", sessionArr)
+
+		// Always (re)issue the cookie with a TTL so the session sticks across
+		// browser tabs / restarts during the day. Previously only emitted on
+		// session creation, so refreshing extended nothing.
+		if env.Writer != nil {
+			http.SetCookie(env.Writer, &http.Cookie{
+				Name:     "ESH_SESSION",
+				Value:    id,
+				Path:     "/",
+				HttpOnly: true,
+				MaxAge:   86400,
+				SameSite: http.SameSiteLaxMode,
+			})
+		}
 		return NULL_VALUE
 	}}
 
@@ -325,10 +384,19 @@ func init() {
 		if !ok {
 			return &Error{Message: "session_set key must be string"}
 		}
+		if env.SessionID == "" {
+			return &Error{Message: "session_set: session not started"}
+		}
 		if env.SessionData == nil {
 			env.SessionData = map[string]string{}
 		}
 		env.SessionData[key.Value] = args[1].Inspect()
+		// Keep _SESSION in sync so subsequent reads in the same request see it
+		if sess, ok := env.Get("$_SESSION"); ok {
+			if sessArr, ok := sess.(*Array); ok {
+				sessArr.Set(ArrayKey{IsString: true, StrVal: key.Value}, args[1])
+			}
+		}
 		saveSessionData(env.SessionID, env.SessionData)
 		return NULL_VALUE
 	}}
@@ -339,6 +407,7 @@ func init() {
 			env.SessionData = map[string]string{}
 			env.SessionID = ""
 		}
+		env.Set("$_SESSION", NewArray())
 		if env.Writer != nil {
 			http.SetCookie(env.Writer, &http.Cookie{
 				Name:    "ESH_SESSION",
@@ -349,6 +418,45 @@ func init() {
 			})
 		}
 		return NULL_VALUE
+	}}
+
+	builtins["csrf_token"] = &Builtin{Name: "csrf_token", Fn: func(env *Environment, args ...Object) Object {
+		if env.SessionID == "" {
+			return &Error{Message: "csrf_token: session not started (call session_start() first)"}
+		}
+		if env.SessionData == nil {
+			env.SessionData = map[string]string{}
+		}
+		token, ok := env.SessionData["_csrf"]
+		if !ok || token == "" {
+			token = generateSessionID()
+			env.SessionData["_csrf"] = token
+			saveSessionData(env.SessionID, env.SessionData)
+			if sess, ok := env.Get("$_SESSION"); ok {
+				if sessArr, ok := sess.(*Array); ok {
+					sessArr.Set(ArrayKey{IsString: true, StrVal: "_csrf"}, &String{Value: token})
+				}
+			}
+		}
+		return &String{Value: token}
+	}}
+
+	// csrf_verify does a constant-time comparison against the token stored in
+	// the session, so a delete/edit action can require it was rendered by us
+	// rather than forged as a bare link on another page.
+	builtins["csrf_verify"] = &Builtin{Name: "csrf_verify", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) != 1 {
+			return &Error{Message: "csrf_verify expects 1 argument"}
+		}
+		given, ok := args[0].(*String)
+		if !ok || env.SessionData == nil {
+			return FALSE_VALUE
+		}
+		expected, ok := env.SessionData["_csrf"]
+		if !ok || expected == "" {
+			return FALSE_VALUE
+		}
+		return boolToObj(subtle.ConstantTimeCompare([]byte(given.Value), []byte(expected)) == 1)
 	}}
 
 	builtins["password_hash"] = &Builtin{Name: "password_hash", Fn: func(env *Environment, args ...Object) Object {
@@ -393,6 +501,38 @@ func init() {
 		return NULL_VALUE
 	}}
 
+	builtins["header"] = &Builtin{Name: "header", Fn: func(env *Environment, args ...Object) Object {
+		if len(args) != 1 {
+			return &Error{Message: "header expects 1 argument"}
+		}
+		if env.Writer == nil {
+			return &Error{Message: "header only available in HTTP context"}
+		}
+		s, ok := args[0].(*String)
+		if !ok {
+			return &Error{Message: "header expects string"}
+		}
+		parts := strings.SplitN(s.Value, ":", 2)
+		if len(parts) != 2 {
+			return &Error{Message: "header expects 'Name: Value' format"}
+		}
+		name := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if strings.ToLower(name) == "location" {
+			http.Redirect(env.Writer, env.Request, value, http.StatusFound)
+		} else {
+			env.Writer.Header().Set(name, value)
+		}
+		return NULL_VALUE
+	}}
+
+	// exit() returns a sentinel error that the evaluator recognises and
+	// swallows, so the script terminates cleanly without bubbling up as
+	// a "real" runtime error.
+	builtins["exit"] = &Builtin{Name: "exit", Fn: func(env *Environment, args ...Object) Object {
+		return &Error{Message: "EXIT_SENTINEL"}
+	}}
+
 	builtins["http_response_code"] = &Builtin{Name: "http_response_code", Fn: func(env *Environment, args ...Object) Object {
 		if len(args) != 1 {
 			return &Error{Message: "http_response_code expects 1 argument"}
@@ -428,14 +568,21 @@ func init() {
 		if len(args) != 1 {
 			return &Error{Message: "htmlspecialchars expects 1 argument"}
 		}
-		s, ok := args[0].(*String)
-		if !ok {
+		var raw string
+		switch v := args[0].(type) {
+		case *String:
+			raw = v.Value
+		case *Null:
+			raw = ""
+		case *Integer, *Float, *Boolean:
+			raw = v.Inspect()
+		default:
 			return &Error{Message: "htmlspecialchars expects string"}
 		}
 		r := strings.NewReplacer(
 			"&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&#34;", "'", "&#39;",
 		)
-		return &String{Value: r.Replace(s.Value)}
+		return &String{Value: r.Replace(raw)}
 	}}
 
 	builtins["trim"] = &Builtin{Name: "trim", Fn: func(env *Environment, args ...Object) Object {
@@ -453,13 +600,43 @@ func init() {
 		if len(args) != 3 {
 			return &Error{Message: "str_replace expects (search, replace, subject)"}
 		}
-		search, ok1 := args[0].(*String)
-		replace, ok2 := args[1].(*String)
+		getStrings := func(obj Object) ([]string, bool) {
+			if s, ok := obj.(*String); ok {
+				return []string{s.Value}, true
+			}
+			if a, ok := obj.(*Array); ok {
+				var res []string
+				for _, k := range a.Order {
+					v := a.Items[k]
+					if s, ok := v.(*String); ok {
+						res = append(res, s.Value)
+					} else {
+						return nil, false
+					}
+				}
+				return res, true
+			}
+			return nil, false
+		}
+		searchArr, ok1 := getStrings(args[0])
+		replaceArr, ok2 := getStrings(args[1])
 		subject, ok3 := args[2].(*String)
 		if !ok1 || !ok2 || !ok3 {
-			return &Error{Message: "str_replace expects string arguments"}
+			return &Error{Message: "str_replace expects string or array of strings arguments"}
 		}
-		return &String{Value: strings.ReplaceAll(subject.Value, search.Value, replace.Value)}
+		res := subject.Value
+		if len(searchArr) == 1 && len(replaceArr) == 1 {
+			res = strings.ReplaceAll(res, searchArr[0], replaceArr[0])
+		} else {
+			for i, s := range searchArr {
+				r := ""
+				if i < len(replaceArr) {
+					r = replaceArr[i]
+				}
+				res = strings.ReplaceAll(res, s, r)
+			}
+		}
+		return &String{Value: res}
 	}}
 
 	builtins["str_contains"] = &Builtin{Name: "str_contains", Fn: func(env *Environment, args ...Object) Object {

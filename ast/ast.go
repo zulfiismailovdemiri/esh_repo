@@ -34,7 +34,7 @@ func (p *Program) String() string {
 // Statements
 
 type AssignStatement struct {
-	Name  *Variable
+	Name  Expression // Can be *Variable or *IndexExpression
 	Value Expression
 }
 
@@ -90,8 +90,8 @@ func (b *BlockStatement) String() string {
 
 type IfStatement struct {
 	Condition   Expression
-	Consequence *BlockStatement
-	Alternative Statement // nil, *IfStatement (else if) or *BlockStatement (else)
+	Consequence Statement
+	Alternative Statement // nil, *IfStatement (else if), *BlockStatement, or any single Statement
 }
 
 func (i *IfStatement) stmtNode() {}
@@ -105,7 +105,7 @@ func (i *IfStatement) String() string {
 
 type WhileStatement struct {
 	Condition Expression
-	Body      *BlockStatement
+	Body      Statement
 }
 
 func (w *WhileStatement) stmtNode() {}
@@ -117,7 +117,7 @@ type ForStatement struct {
 	Init      Statement
 	Condition Expression
 	Post      Statement
-	Body      *BlockStatement
+	Body      Statement
 }
 
 func (f *ForStatement) stmtNode() {}
@@ -135,7 +135,7 @@ type ForeachStatement struct {
 	Iterable Expression
 	KeyVar   *Variable
 	ValueVar *Variable
-	Body     *BlockStatement
+	Body     Statement
 }
 
 func (f *ForeachStatement) stmtNode() {}
@@ -168,7 +168,7 @@ type Variable struct {
 }
 
 func (v *Variable) exprNode()      {}
-func (v *Variable) String() string { return "$" + v.Name }
+func (v *Variable) String() string { return v.Name } // Name already includes the leading '$'
 
 type Identifier struct { // for function names
 	Name string

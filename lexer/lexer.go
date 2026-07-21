@@ -1,5 +1,11 @@
 package esh_vendors
 
+// escapedDollarMarker stands in for a user-written "\$" while a string
+// literal's value is being built. It is not '$' itself so that the
+// interpolation pass in evaluator.go, which runs later over the finished
+// string, doesn't re-match it as the start of a "$name" substitution.
+const escapedDollarMarker = '\x00'
+
 type Lexer struct {
 	input        string
 	position     int
@@ -80,6 +86,23 @@ func (l *Lexer) NextToken() Token {
 				l.readChar()
 			}
 			return l.NextToken()
+		} else if l.peekChar() == '*' {
+			l.readChar() // consume '*'
+			for {
+				l.readChar()
+				if l.ch == 0 {
+					break
+				}
+				if l.ch == '*' && l.peekChar() == '/' {
+					l.readChar() // consume '*'
+					l.readChar() // consume '/'
+					break
+				}
+				if l.ch == '\n' {
+					l.line++
+				}
+			}
+			return l.NextToken()
 		} else if l.peekChar() == '=' {
 			l.readChar()
 			tok = Token{DIV_ASSIGN, "/=", l.line}
@@ -158,7 +181,13 @@ func (l *Lexer) NextToken() Token {
 	case '$':
 		l.readChar()
 		if isLetter(l.ch) {
-			lit := l.readIdentifier()
+			// Keep the leading '$' in the token literal so variable names are
+			// stored under their PHP-visible form (e.g. "$_POST", "$_SERVER").
+			// This lets the runtime use the same key the user wrote, removes
+			// the need to track which dollar-prefixed locations expect a
+			// stripped vs full name, and avoids accidental collisions with
+			// bare identifiers like a function called `_POST`.
+			lit := "$" + l.readIdentifier()
 			return Token{VAR, lit, l.line}
 		}
 		tok = Token{ILLEGAL, "$", l.line}
@@ -236,7 +265,11 @@ func (l *Lexer) readString() string {
 			case '"':
 				sb = append(sb, '"')
 			case '$':
-				sb = append(sb, '$')
+				// Emit a marker rather than a literal '$' so a later
+				// interpolation pass (which runs on the finished string, long
+				// after escape processing here) can't mistake this for an
+				// unescaped "$name" and substitute a variable into it.
+				sb = append(sb, escapedDollarMarker)
 			default:
 				// If we don't recognize the escape, keep the backslash
 				sb = append(sb, '\\')
